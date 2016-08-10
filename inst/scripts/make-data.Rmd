@@ -1,0 +1,124 @@
+Download the following FASTQ files to local dir
+
+```{r}
+metadata <- read.csv("../extdata/metadata.csv", stringsAsFactors=FALSE)
+files <- metadata$SourceUrl
+all.files <- c(files, sub("_1.fastq.gz","_2.fastq.gz",files))
+```
+
+Run HISAT2 to align paired-end reads to genome
+
+<https://ccb.jhu.edu/software/hisat2/index.shtml>
+
+With the genome: H. sapiens, Ensembl GRCh38 genome_tran (this is version 84)
+
+<ftp://ftp.ccb.jhu.edu/pub/infphilo/hisat2/data/grch38_tran.tar.gz>
+
+```
+hisat2 -x $genome -1 $dir/$f\_1.fastq.gz -2 $dir/$f\_2.fastq.gz -p 10 -k 1 > out/$f.sam
+samtools view -@ 4 -b out/$f.sam | samtools sort -@ 4 -O bam -T tmp - > out/$f.bam
+samtools index out/$f.bam
+```
+
+Resulting in SAM and BAM files:
+
+```{r}
+sam.files <- paste0("out/",metadata$Title,".sam")
+bam.files <- paste0("out/",metadata$Title,".bam")
+```
+
+Download the corresponding Ensembl GTF file
+
+<ftp://ftp.ensembl.org/pub/release-84/gtf/homo_sapiens/Homo_sapiens.GRCh38.84.gtf.gz>
+
+```{r}
+gtf.file <- "Homo_sapiens.GRCh38.84.gtf"
+```
+
+Count paired-end reads to genes using featureCounts
+
+```{r}
+library(Rsubread)
+if (!file.exists("featurecounts.rda")) {
+  fc <- featureCounts(files=sam.files,
+                      annot.ext=gtf.file,
+                      isGTFAnnotationFile=TRUE,
+                      isPairedEnd=TRUE,
+                      autosort=FALSE)
+  save(fc, file="featurecounts.rda")
+} else {
+  load("featurecounts.rda")
+}
+```
+
+Select a set of genes with moderate counts, not too high so that we
+keep the size of the output files small.
+
+```{r}
+mid.count.idx <- rowMeans(fc$counts) > 200 & rowMeans(fc$counts) < 2000
+sum(mid.count.idx)
+mid.count.genes <- rownames(fc$counts)[mid.count.idx]
+```
+
+Load an Ensembl TxDb and select certain genes:
+
+```{r}
+library(ensembldb)
+if (!file.exists(basename(gtf.file))) {
+  ensDbFromGtf(gtf.file, outfile=basename(gtf.file))
+}
+txdb <- EnsDb(basename(gtf.file))
+
+# names of single isoform genes
+txdf <- transcripts(txdb, return.type="DataFrame")
+tab <- table(txdf$gene_id)
+one.iso.genes <- names(tab)[tab == 1]
+two.iso.genes <- names(tab)[tab == 2]
+three.iso.genes <- names(tab)[tab == 3]
+
+# subset to genes with moderate counts and
+# possessing a single isoform
+g <- genes(txdb)
+g <- keepSeqlevels(g, sort(c(as.character(1:22),"X","Y","MT")))
+
+table(mid.count.genes %in% one.iso.genes)
+table(mid.count.genes %in% two.iso.genes)
+table(mid.count.genes %in% three.iso.genes)
+
+intersect.genes <- intersect(names(g), mid.count.genes)
+
+set.seed(1)
+idx.genes <- c(sample(intersect(intersect.genes, one.iso.genes),30),
+               sample(intersect(intersect.genes, two.iso.genes),10),
+               sample(intersect(intersect.genes, three.iso.genes),10))
+
+g.sub <- sort(g[idx.genes])
+write(names(g.sub), file="../extdata/selected.genes.txt")
+```
+
+Extract paired-end reads covering these genes for each BAM:
+
+```{r}
+library(GenomicAlignments)
+library(rtracklayer)
+for (i in seq_len(nrow(metadata))) {
+  # read in
+  pt <- proc.time()
+  ga <- readGAlignments(bam.files[i], use.names=TRUE,
+                        param=ScanBamParam(which=g.sub,
+                          what=c("flag","mrnm","mpos"),
+                          flag=scanBamFlag(isProperPair=TRUE,
+                            isSecondaryAlignment=FALSE)))
+  gap <- makeGAlignmentPairs(ga)
+  et <- unname((proc.time() - pt)[3])
+  print(paste(i,round(et),length(gap)))
+  # export to BAM
+  pt <- proc.time()
+  export(gap, con=paste0("out/",metadata$Title[i],"_galignpairs.bam"), format="bam")
+  et <- unname((proc.time() - pt)[3])
+  print(paste(i,round(et),length(gap)))
+  # save as .rda
+  assign(metadata$Title[i], gap)
+  save(list=metadata$Title[i], file=paste0("out/",metadata$Title[i],".rda"))
+}
+```
